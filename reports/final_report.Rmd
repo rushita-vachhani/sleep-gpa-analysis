@@ -1,0 +1,250 @@
+---
+title: "INFO 6105 Final Project"
+subtitle: "Impact of Sleep Duration on Academic Performance (GPA)"
+author: "Rushita Vachhani"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5)
+
+library(tidyverse)
+library(broom)
+library(car)
+library(pROC)
+library(caret)
+library(here)
+library(GGally)
+```
+
+```{=html}
+<style>
+body { font-family: 'Palatino', 'Georgia', serif; }
+h1, h2 { color: #C8102E; border-bottom: 2px solid #C8102E; padding-bottom: 4px; }
+h3 { color: #444444; }
+.fill-box {
+  border: 2px solid #C8102E; padding: 12px; margin: 10px 0;
+  background-color: #fdf5f5; border-radius: 5px;
+}
+.concept-box {
+  border: 2px solid #2166AC; padding: 12px; margin: 10px 0;
+  background-color: #f0f6fc; border-radius: 5px;
+}
+</style>
+```
+------------------------------------------------------------------------
+
+
+# Introduction
+
+This project investigates whether **sleep duration impacts academic performance (GPA)** using real-world student data.
+
+We apply multiple statistical methods to evaluate this relationship while controlling for additional academic factors.
+
+
+```{r}
+df <- read.csv(here("data/raw/cmu-sleep.csv"))
+
+df_clean <- df %>%
+  select(term_gpa, TotalSleepTime, cum_gpa, Zterm_units_ZofZ, study) %>%
+  mutate(
+    TotalSleepTime = TotalSleepTime / 60,
+    high_gpa = if_else(term_gpa >= 3.0, 1, 0),
+    high_gpa = factor(high_gpa, levels = c(0, 1)),
+    study = factor(study)
+  )
+
+glimpse(df_clean)
+```
+
+::: fill-box
+Key Preparation Steps:
+	•	Converted sleep time into hours
+	•	Created binary outcome (high_gpa)
+	•	Converted categorical variables to factors
+:::
+
+------------------------------------------------------------------------
+
+# Exploratory Data Analysis
+
+## GPA Distribution
+
+```{r}
+
+ggplot(df_clean, aes(term_gpa)) +
+  geom_histogram(fill = "steelblue", bins = 30) +
+  labs(title = "Distribution of GPA", x = "GPA", y = "Count")
+```
+
+::: fill-box
+GPA is approximately normally distributed with concentration in mid-to-high ranges.
+:::
+
+## Sleep Distribution
+
+```{r}
+ggplot(df_clean, aes(TotalSleepTime)) +
+  geom_density(fill = "purple", alpha = 0.4) +
+  labs(title = "Sleep Duration Distribution", x = "Hours", y = "Density")
+
+```
+
+## Sleep vs GPA
+
+```{r}
+ggplot(df_clean, aes(TotalSleepTime, term_gpa)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "Sleep vs GPA", x = "Sleep (hours)", y = "GPA")
+```
+
+::: fill-box
+A slight positive trend suggests that higher sleep duration may be associated with higher GPA.
+:::
+
+## GPA by Study Type
+
+```{r}
+
+ggplot(df_clean, aes(study, term_gpa)) +
+  geom_boxplot(fill = "orange") +
+  labs(title = "GPA by Study Type", x = "Study", y = "GPA")
+
+```
+
+## Correlation Matrix
+
+```{r}
+
+df_clean %>%
+  select(term_gpa, TotalSleepTime, cum_gpa) %>%
+  GGally::ggpairs()
+
+```
+
+::: fill-box
+Cumulative GPA shows the strongest relationship with term GPA, while sleep has a weaker but positive association.
+:::
+
+## Multiple Linear Regression
+
+```{r}
+
+mlr <- lm(term_gpa ~ TotalSleepTime + cum_gpa + Zterm_units_ZofZ, data = df_clean)
+summary(mlr)
+
+```
+
+::: fill-box
+	•	cum_gpa is expected to be the strongest predictor
+	•	Sleep duration may have a smaller positive effect
+:::
+
+## Diagnostics
+
+```{r}
+
+par(mfrow = c(2,2))
+plot(mlr)
+
+```
+
+## One-Way ANOVA
+
+```{r}
+
+anova_model <- aov(term_gpa ~ study, data = df_clean)
+summary(anova_model)
+
+TukeyHSD(anova_model)
+
+```
+
+::: fill-box
+ANOVA tests whether GPA differs significantly across study groups.
+:::
+
+## Logistic Regression
+
+```{r}
+log_model <- glm(high_gpa ~ TotalSleepTime + cum_gpa + Zterm_units_ZofZ,
+                 data = df_clean, family = binomial)
+
+summary(log_model)
+
+```
+
+
+## ROC Curve
+
+```{r}
+
+# Get data used in model (after NA removal)
+model_data <- model.frame(log_model)
+
+# Predicted probabilities (same length as model_data)
+prob <- predict(log_model, type = "response")
+
+# ROC using aligned data
+roc_obj <- roc(model_data$high_gpa, prob)
+
+plot(roc_obj, col = "blue")
+auc(roc_obj)
+
+```
+
+## Confusion Matrix
+
+```{r}
+
+# Use same model data
+actual <- model_data$high_gpa
+
+pred <- if_else(prob > 0.5, 1, 0) %>%
+  factor(levels = c(0,1))
+
+confusionMatrix(pred, actual)
+```
+
+::: fill-box
+Logistic regression evaluates classification performance of predicting high GPA.
+:::
+
+## Nonparametric Analysis
+
+```{r}
+
+kruskal.test(term_gpa ~ study, data = df_clean)
+
+cor.test(df_clean$TotalSleepTime, df_clean$term_gpa, method = "spearman")
+
+```
+
+::: fill-box
+Nonparametric tests validate results without strict distributional assumptions.
+:::
+
+# Conclusion
+	•	Cumulative GPA is the strongest predictor of academic performance
+	•	Sleep duration shows a positive but moderate relationship with GPA
+	•	Results are consistent across multiple statistical approaches
+Overall, maintaining healthy sleep patterns may contribute to improved academic outcomes.
+
+
+
+
+
+
+
+

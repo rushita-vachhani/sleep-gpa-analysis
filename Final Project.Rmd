@@ -1,0 +1,258 @@
+# =========================================================
+# INFO 6105 Final Project
+# Impact of Sleep Duration on Academic Performance (GPA)
+# =========================================================
+
+# -----------------------------
+# 1. Libraries
+# -----------------------------
+library(tidyverse)
+library(broom)
+library(car)
+library(emmeans)
+library(multcomp)
+library(pROC)
+library(caret)
+library(knitr)
+
+# -----------------------------
+# 2. Load data
+# -----------------------------
+# Replace with your actual file name
+df <- read.csv("your_dataset.csv")
+
+# Quick look
+glimpse(df)
+summary(df)
+
+# -----------------------------
+# 3. Data cleaning
+# -----------------------------
+# Keep only variables needed for project
+df0 <- df %>%
+  select(term_gpa, TotalSleepTime, cum_gpa, Zterm_units_ZofZ, study)
+
+# Convert sleep to hours if stored in minutes
+# Comment this out if your data is already in hours
+df0 <- df0 %>%
+  mutate(TotalSleepTime = TotalSleepTime / 60)
+
+# Derived binary response
+df0 <- df0 %>%
+  mutate(high_gpa = if_else(term_gpa >= 3.0, 1, 0),
+         high_gpa = factor(high_gpa, levels = c(0, 1)))
+
+# Clean study as factor
+df0 <- df0 %>%
+  mutate(study = factor(study))
+
+# Dataset for regression/logistic: listwise deletion
+df_model <- df0 %>%
+  drop_na(term_gpa, TotalSleepTime, cum_gpa, Zterm_units_ZofZ, study, high_gpa)
+
+# Reduced sensitivity dataset without course load
+df_reduced <- df0 %>%
+  drop_na(term_gpa, TotalSleepTime, cum_gpa, study, high_gpa)
+
+# -----------------------------
+# 4. Summary statistics
+# -----------------------------
+summary_table <- df0 %>%
+  summarise(
+    mean_term_gpa = mean(term_gpa, na.rm = TRUE),
+    sd_term_gpa   = sd(term_gpa, na.rm = TRUE),
+    min_term_gpa  = min(term_gpa, na.rm = TRUE),
+    max_term_gpa  = max(term_gpa, na.rm = TRUE),
+
+    mean_sleep = mean(TotalSleepTime, na.rm = TRUE),
+    sd_sleep   = sd(TotalSleepTime, na.rm = TRUE),
+    min_sleep  = min(TotalSleepTime, na.rm = TRUE),
+    max_sleep  = max(TotalSleepTime, na.rm = TRUE),
+
+    mean_cum_gpa = mean(cum_gpa, na.rm = TRUE),
+    sd_cum_gpa   = sd(cum_gpa, na.rm = TRUE),
+    min_cum_gpa  = min(cum_gpa, na.rm = TRUE),
+    max_cum_gpa  = max(cum_gpa, na.rm = TRUE)
+  )
+
+kable(summary_table, digits = 2)
+
+# Missingness
+missing_table <- sapply(df0, function(x) sum(is.na(x)))
+missing_pct <- round(100 * missing_table / nrow(df0), 2)
+data.frame(variable = names(missing_table),
+           missing_n = missing_table,
+           missing_pct = missing_pct) %>%
+  kable()
+
+# -----------------------------
+# 5. Exploratory visualizations
+# -----------------------------
+# Scatterplot
+ggplot(df0, aes(x = TotalSleepTime, y = term_gpa)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  labs(title = "Sleep Duration vs Term GPA",
+       x = "Total Sleep Time (hours)",
+       y = "Term GPA")
+
+# Boxplot by university
+ggplot(df0, aes(x = study, y = term_gpa)) +
+  geom_boxplot() +
+  labs(title = "Term GPA by University",
+       x = "University",
+       y = "Term GPA")
+
+# High GPA by sleep categories
+df0 <- df0 %>%
+  mutate(sleep_cat = case_when(
+    TotalSleepTime < 6 ~ "Low (<6h)",
+    TotalSleepTime <= 8 ~ "Medium (6-8h)",
+    TRUE ~ "High (>8h)"
+  )) %>%
+  mutate(sleep_cat = factor(sleep_cat, levels = c("Low (<6h)", "Medium (6-8h)", "High (>8h)")))
+
+ggplot(df0, aes(x = sleep_cat, fill = high_gpa)) +
+  geom_bar(position = "fill") +
+  labs(title = "Proportion of High GPA Across Sleep Categories",
+       x = "Sleep Category",
+       y = "Proportion",
+       fill = "High GPA")
+
+# -----------------------------
+# 6. Multiple Linear Regression
+# -----------------------------
+mlr_model <- lm(term_gpa ~ TotalSleepTime + cum_gpa + Zterm_units_ZofZ, data = df_model)
+summary(mlr_model)
+
+# R^2 and Adjusted R^2
+glance(mlr_model)
+
+# Coefficients table
+tidy(mlr_model, conf.int = TRUE) %>%
+  kable(digits = 4)
+
+# VIF
+vif(mlr_model)
+
+# Diagnostics
+par(mfrow = c(2, 2))
+plot(mlr_model)
+par(mfrow = c(1, 1))
+
+# Additional diagnostic plots
+# Residuals vs fitted
+ggplot(data.frame(fitted = fitted(mlr_model), resid = resid(mlr_model)),
+       aes(x = fitted, y = resid)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Residuals vs Fitted", x = "Fitted", y = "Residuals")
+
+# QQ plot
+qqnorm(resid(mlr_model))
+qqline(resid(mlr_model), col = "red")
+
+# Scale-location
+plot(mlr_model, which = 3)
+
+# Sensitivity model without course load
+mlr_reduced <- lm(term_gpa ~ TotalSleepTime + cum_gpa, data = df_reduced)
+summary(mlr_reduced)
+
+# -----------------------------
+# 7. One-Way ANOVA
+# -----------------------------
+anova_model <- aov(term_gpa ~ study, data = df0)
+summary(anova_model)
+
+# Tukey HSD
+tukey_res <- TukeyHSD(anova_model)
+tukey_res
+
+# Effect size eta^2
+anova_table <- summary(anova_model)[[1]]
+ss_between <- anova_table["study", "Sum Sq"]
+ss_total <- sum(anova_table[, "Sum Sq"])
+eta_sq <- ss_between / ss_total
+eta_sq
+
+# Assumption checks
+# Normality of residuals
+shapiro.test(residuals(anova_model))
+
+# Equal variance
+leveneTest(term_gpa ~ study, data = df0)
+
+# Group summaries
+df0 %>%
+  group_by(study) %>%
+  summarise(
+    n = n(),
+    mean = mean(term_gpa, na.rm = TRUE),
+    sd = sd(term_gpa, na.rm = TRUE),
+    median = median(term_gpa, na.rm = TRUE),
+    IQR = IQR(term_gpa, na.rm = TRUE)
+  ) %>%
+  kable(digits = 3)
+
+# -----------------------------
+# 8. Logistic Regression
+# -----------------------------
+logit_model <- glm(high_gpa ~ TotalSleepTime + cum_gpa + Zterm_units_ZofZ,
+                   data = df_model,
+                   family = binomial)
+
+summary(logit_model)
+
+# Odds ratios
+exp(cbind(OR = coef(logit_model), confint(logit_model)))
+
+# Predicted probabilities
+df_model$pred_prob <- predict(logit_model, type = "response")
+
+# Default threshold = 0.5
+df_model$pred_class <- if_else(df_model$pred_prob >= 0.5, "1", "0") %>%
+  factor(levels = c("0", "1"))
+
+confusionMatrix(df_model$pred_class, df_model$high_gpa, positive = "1")
+
+# ROC and AUC
+roc_obj <- roc(response = df_model$high_gpa, predictor = df_model$pred_prob, levels = c("0", "1"))
+plot(roc_obj, col = "blue", main = "ROC Curve")
+auc(roc_obj)
+
+# Optional threshold exploration
+thresholds <- seq(0.3, 0.7, by = 0.05)
+threshold_eval <- map_df(thresholds, function(th) {
+  pred <- if_else(df_model$pred_prob >= th, "1", "0") %>% factor(levels = c("0", "1"))
+  cm <- confusionMatrix(pred, df_model$high_gpa, positive = "1")
+  tibble(
+    threshold = th,
+    accuracy = cm$overall["Accuracy"],
+    sensitivity = cm$byClass["Sensitivity"],
+    specificity = cm$byClass["Specificity"],
+    precision = cm$byClass["Pos Pred Value"]
+  )
+})
+
+threshold_eval %>% kable(digits = 3)
+
+# -----------------------------
+# 9. Nonparametric Analysis
+# -----------------------------
+kruskal.test(term_gpa ~ study, data = df0)
+
+# Optional Spearman if you examine monotonic sleep-GPA association
+cor.test(df0$TotalSleepTime, df0$term_gpa, method = "spearman", use = "complete.obs")
+
+# -----------------------------
+# 10. Save key outputs
+# -----------------------------
+write.csv(as.data.frame(tidy(mlr_model, conf.int = TRUE)),
+          "mlr_coefficients.csv", row.names = FALSE)
+
+write.csv(as.data.frame(threshold_eval),
+          "logistic_threshold_eval.csv", row.names = FALSE)
+
+# Session info for reproducibility
+sessionInfo()
