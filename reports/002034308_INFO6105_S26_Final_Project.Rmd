@@ -207,15 +207,16 @@ p_prop <- df_model %>%
   group_by(sleep_cat) %>%
   mutate(prop = n / sum(n)) %>%
   filter(high_gpa == 1) %>%
-  ggplot(aes(sleep_cat, prop, fill = sleep_cat)) +
-  geom_col(width = 0.55) +
+  ggplot(aes(sleep_cat, prop)) +
+  geom_col(fill = "#2166AC", width = 0.55) +
   geom_text(aes(label = percent(prop, accuracy = 1)), vjust = -0.4, size = 4) +
-  scale_fill_viridis_d(option = "D", begin = 0.2, end = 0.8) +
   scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
   theme_minimal(base_size = 12) +
-  theme(legend.position = "none") +
-  labs(title = "Proportion with High GPA by Sleep Category",
-       x = "Sleep Category", y = "Proportion (High GPA)")
+  labs(
+    title = "High GPA Proportion by Sleep",
+    x = "Sleep Category",
+    y = "Proportion (High GPA)"
+  )
 
 p_count <- df_model %>%
   count(sleep_cat, high_gpa) %>%
