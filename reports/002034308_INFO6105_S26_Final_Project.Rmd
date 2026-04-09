@@ -1,0 +1,1087 @@
+---
+title: "INFO 6105 Final Project"
+subtitle: "Impact of Sleep Duration on Academic Performance (GPA)"
+author: "Rushita Vachhani | 002034308 | Section 37198"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+set.seed(6105) # Reproducibility
+
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 9, fig.height = 5.5, fig.align = "center"
+)
+
+library(tidyverse)
+library(broom)
+library(car)
+library(pROC)
+library(caret)
+library(here)
+library(GGally)
+library(corrplot)
+library(patchwork)
+library(viridis)
+library(knitr)
+library(scales)
+library(purrr)
+library(randomForest)
+library(glmnet)
+```
+
+```{=html}
+<style>
+body { font-family: 'Palatino', 'Georgia', serif; font-size: 15px; }
+h1, h2 { color: #C8102E; border-bottom: 2px solid #C8102E; padding-bottom: 4px; }
+h3 { color: #333333; }
+.fill-box {
+  border: 2px solid #C8102E; padding: 12px; margin: 10px 0;
+  background-color: #fdf5f5; border-radius: 5px;
+}
+.concept-box {
+  border: 2px solid #2166AC; padding: 12px; margin: 10px 0;
+  background-color: #f0f6fc; border-radius: 5px;
+}
+.result-box {
+  border: 2px solid #22863a; padding: 12px; margin: 10px 0;
+  background-color: #f0fff4; border-radius: 5px;
+}
+</style>
+```
+
+---
+
+# Introduction
+
+This project investigates whether **sleep duration impacts academic performance
+(GPA)** using real student wearable + academic data from Carnegie Mellon
+University's Statistics & Data Science Repository.
+
+We apply multiple statistical methods - Multiple Linear Regression, ANOVA,
+Logistic Regression, Nonparametric Validation, and a Machine Learning pipeline
+- to rigorously evaluate this relationship while controlling for cumulative
+GPA and course load.
+
+::: concept-box
+**Research Questions:**
+
+1. Does sleep duration significantly affect term GPA after controlling for cumulative GPA and course load?
+2. Does mean GPA differ across study groups (universities/cohorts)?
+3. How does sleep influence the probability of achieving a high GPA (≥ 3.0)?
+4. Are findings robust under nonparametric assumptions?
+:::
+
+---
+
+# Data Preparation
+
+```{r load-data}
+df_raw <- read.csv(here("data/raw/cmu-sleep.csv"))
+
+df <- df_raw %>%
+  select(term_gpa, TotalSleepTime, cum_gpa, Zterm_units_ZofZ, study) %>%
+  mutate(
+    TotalSleepTime = TotalSleepTime / 60,           # minutes -> hours
+    high_gpa       = factor(if_else(term_gpa >= 3.0, 1, 0), levels = c(0, 1)),
+    study          = factor(study),
+    sleep_cat      = factor(
+      case_when(
+        TotalSleepTime < 6  ~ "Low (<6h)",
+        TotalSleepTime <= 8 ~ "Medium (6-8h)",
+        TRUE                ~ "High (>8h)"
+      ),
+      levels = c("Low (<6h)", "Medium (6-8h)", "High (>8h)")
+    )
+  )
+
+# Complete-case dataset for all models
+df_model <- df %>%
+  drop_na(term_gpa, TotalSleepTime, cum_gpa, Zterm_units_ZofZ, study, high_gpa)
+```
+
+## Dataset Overview
+
+```{r missingness-table}
+# Missingness summary (for report Section 2)
+tibble(
+  Variable    = c("term_gpa", "TotalSleepTime (hrs)", "cum_gpa",
+                  "Zterm_units_ZofZ", "study (groups)"),
+  N_complete  = c(sum(!is.na(df$term_gpa)), sum(!is.na(df$TotalSleepTime)),
+                  sum(!is.na(df$cum_gpa)),
+                  sum(!is.na(df$Zterm_units_ZofZ)),
+                  sum(!is.na(df$study))),
+  Missing     = c(sum(is.na(df$term_gpa)), sum(is.na(df$TotalSleepTime)),
+                  sum(is.na(df$cum_gpa)), sum(is.na(df$Zterm_units_ZofZ)),
+                  sum(is.na(df$study))),
+  Pct_Missing = paste0(round(Missing / nrow(df) * 100, 1), "%")
+) %>%
+  kable(caption = "Table 1: Variable Completeness Summary")
+```
+
+```{r descriptive-stats}
+# Descriptive statistics (for report Section 2)
+df_model %>%
+  summarise(
+    across(c(term_gpa, TotalSleepTime, cum_gpa),
+           list(Mean = ~round(mean(.), 2), SD = ~round(sd(.), 2),
+                Min  = ~round(min(.), 2),  Max = ~round(max(.), 2)),
+           .names = "{.col}_{.fn}")
+  ) %>%
+  pivot_longer(everything(), names_to = c("Variable", "Stat"),
+               names_sep = "_(?=[^_]+$)") %>%
+  pivot_wider(names_from = Stat, values_from = value) %>%
+  kable(caption = "Table 2: Descriptive Statistics (Complete Cases)")
+```
+
+::: fill-box
+**Key Preparation Steps**
+
+- Sleep time converted from minutes to hours for interpretability
+- Binary outcome `high_gpa` created (1 = term GPA ≥ 3.0)
+- Sleep categories: Low < 6h, Medium 6–8h, High > 8h
+- Complete-case dataset used for all models: **`r nrow(df_model)` observations**
+:::
+
+---
+
+# Exploratory Data Analysis
+
+## Outcome & Predictor Distributions
+
+```{r eda-distributions, fig.cap="Figure 1: Distribution of term GPA (left) and sleep duration (right)"}
+p1 <- ggplot(df_model, aes(term_gpa)) +
+  geom_histogram(aes(fill = after_stat(x) > 3.0), bins = 30, color = "white") +
+  scale_fill_manual(values = c("FALSE" = "#AAAAAA", "TRUE" = "#C8102E"),
+                    labels = c("< 3.0", "≥ 3.0"), name = "GPA") +
+  theme_minimal(base_size = 12) +
+  labs(title = "Term GPA Distribution", x = "Term GPA", y = "Count")
+
+p2 <- ggplot(df_model, aes(TotalSleepTime)) +
+  geom_density(fill = "#2166AC", alpha = 0.45, color = "white") +
+  geom_vline(xintercept = 7, linetype = "dashed", color = "#C8102E",
+             linewidth = 0.9) +
+  annotate("text", x = 7.2, y = 0.35, label = "7h reference",
+           hjust = 0, color = "#C8102E", size = 3.5) +
+  theme_minimal(base_size = 12) +
+  labs(title = "Sleep Duration Distribution",
+       x = "Total Sleep (hours)", y = "Density")
+
+patchwork::wrap_plots(p1, p2)
+```
+
+::: fill-box
+GPA is left-skewed with most students above 3.0. Sleep clusters around 6–8
+hours, with the majority below the recommended 7-hour threshold.
+:::
+
+## Sleep vs GPA Scatterplot
+
+```{r sleep-gpa-scatter, fig.cap="Figure 2: Scatterplot of sleep duration vs term GPA with regression line"}
+ggplot(df_model, aes(TotalSleepTime, term_gpa, color = high_gpa)) +
+  geom_point(alpha = 0.45, size = 1.8) +
+  geom_smooth(aes(group = 1), method = "lm", color = "#C8102E",
+              linewidth = 1.1, se = TRUE) +
+  scale_color_manual(values = c("0" = "#AAAAAA", "1" = "#2166AC"),
+                     labels = c("Low GPA", "High GPA"), name = NULL) +
+  theme_minimal(base_size = 12) +
+  labs(title = "Sleep Duration vs Term GPA",
+       subtitle = "Color indicates high (≥3.0) vs low GPA; OLS regression line shown",
+       x = "Total Sleep Time (hours)", y = "Term GPA")
+```
+
+## Sleep Category & High GPA
+
+```{r sleep-cat-bar, fig.height=4.5, fig.cap="Figure 3: Proportion of high GPA students by sleep category"}
+p_prop <- df_model %>%
+  count(sleep_cat, high_gpa) %>%
+  group_by(sleep_cat) %>%
+  mutate(prop = n / sum(n)) %>%
+  filter(high_gpa == 1) %>%
+  ggplot(aes(sleep_cat, prop, fill = sleep_cat)) +
+  geom_col(width = 0.55) +
+  geom_text(aes(label = percent(prop, accuracy = 1)), vjust = -0.4, size = 4) +
+  scale_fill_viridis_d(option = "D", begin = 0.2, end = 0.8) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none") +
+  labs(title = "Proportion with High GPA by Sleep Category",
+       x = "Sleep Category", y = "Proportion (High GPA)")
+
+p_count <- df_model %>%
+  count(sleep_cat, high_gpa) %>%
+  ggplot(aes(sleep_cat, n, fill = high_gpa)) +
+  geom_col(position = "fill", width = 0.55) +
+  scale_fill_manual(values = c("0" = "#AAAAAA", "1" = "#C8102E"),
+                    labels = c("Low GPA", "High GPA"), name = NULL) +
+  scale_y_continuous(labels = percent_format()) +
+  theme_minimal(base_size = 12) +
+  labs(title = "GPA Class by Sleep Category",
+       x = "Sleep Category", y = "Proportion")
+
+p_prop | p_count
+```
+
+## GPA by Study Group
+
+```{r gpa-by-study, fig.cap="Figure 4: Term GPA distribution by university study group"}
+group_stats <- df_model %>%
+  group_by(study) %>%
+  summarise(mean_gpa = mean(term_gpa, na.rm = TRUE),
+            se_gpa   = sd(term_gpa, na.rm = TRUE) / sqrt(n()),
+            n        = n())
+
+ggplot(df_model, aes(study, term_gpa, fill = study)) +
+  geom_boxplot(alpha = 0.5, outlier.shape = 21, outlier.size = 1.5) +
+  geom_point(data = group_stats, aes(study, mean_gpa),
+             shape = 18, size = 4, color = "#C8102E") +
+  geom_errorbar(data = group_stats,
+                aes(x = study, y = mean_gpa,
+                    ymin = mean_gpa - 1.96 * se_gpa,
+                    ymax = mean_gpa + 1.96 * se_gpa),
+                width = 0.15, color = "#C8102E", linewidth = 0.8,
+                inherit.aes = FALSE) +
+  scale_fill_viridis_d(option = "C", begin = 0.1, end = 0.9) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none") +
+  labs(title = "Term GPA by University Study Group",
+       subtitle = "Diamond = group mean; error bars = 95% CI",
+       x = "Study Group", y = "Term GPA")
+```
+
+## Correlation Structure
+
+```{r correlation-heatmap, fig.cap="Figure 5: Correlation matrix of numeric predictors"}
+num_vars <- df_model %>%
+  select(term_gpa, TotalSleepTime, cum_gpa, Zterm_units_ZofZ) %>%
+  rename(
+    "Term GPA"    = term_gpa,
+    "Sleep (hrs)" = TotalSleepTime,
+    "Cum GPA"     = cum_gpa,
+    "Course Load" = Zterm_units_ZofZ
+  )
+
+cor_mat <- cor(num_vars, use = "complete.obs")
+
+corrplot(cor_mat, method = "color", type = "upper",
+         addCoef.col = "black", tl.col = "black",
+         tl.srt = 45,
+         col = colorRampPalette(c("#2166AC", "white", "#C8102E"))(200),
+         na.label = " ",
+         title    = "Correlation Matrix",
+         mar = c(0, 0, 2, 0))
+```
+
+## Pairwise Relationships
+
+```{r ggpairs, fig.height=6, fig.cap="Figure 6: Pairwise variable relationships"}
+ggpairs(
+  num_vars,
+  lower = list(continuous = wrap("points", alpha = 0.3, size = 0.8,
+               color = "#2166AC")),
+  diag  = list(continuous = wrap("densityDiag", fill = "#C8102E", alpha = 0.4)),
+  upper = list(continuous = wrap("cor", size = 4))
+) +
+  theme_minimal(base_size = 10) +
+  labs(title = "Pairwise Variable Relationships")
+```
+
+::: fill-box
+**EDA Takeaways**
+
+- Cumulative GPA shows the strongest correlation with term GPA
+- Sleep duration has a modest but positive correlation with GPA
+- Course load shows a weak relationship
+- Students sleeping >8h have the highest proportion of high GPA
+:::
+
+---
+
+# Multiple Linear Regression
+
+**Research Question:** Does sleep duration significantly affect term GPA after
+controlling for cumulative GPA and course load?
+
+**Hypothesis:** H₀: β_sleep = 0 vs Hₐ: β_sleep ≠ 0
+
+## Model Fitting
+
+```{r mlr-model}
+mlr <- lm(term_gpa ~ TotalSleepTime + cum_gpa + Zterm_units_ZofZ,
+          data = df_model)
+
+# Regression equation coefficients
+tidy(mlr, conf.int = TRUE) %>%
+  mutate(sig = case_when(
+    p.value < 0.001 ~ "***",
+    p.value < 0.01  ~ "**",
+    p.value < 0.05  ~ "*",
+    TRUE            ~ ""
+  )) %>%
+  kable(digits = 4, caption = "Table 3: MLR Coefficients")
+```
+
+```{r mlr-fit}
+# Model fit statistics
+glance(mlr) %>%
+  select(r.squared, adj.r.squared, sigma, statistic, p.value, df, nobs) %>%
+  kable(digits = 4, caption = "Table 4: Model Fit Statistics")
+```
+
+::: result-box
+**Regression Equation:**
+term_gpa = 0.39 + 0.10 × Sleep(hrs) + 0.67 × cum_gpa + 0.03 × CourseLoad
+
+**Interpretation (holding all else constant):**
+
+- Each additional hour of sleep is associated with a **0.10-point increase** in GPA
+- Each 1-point increase in cumulative GPA is associated with a **0.67-point increase** in term GPA
+- Course load is **not statistically significant** (p > 0.05)
+- Model explains approximately **40%** of variance in GPA (R² ≈ 0.41)
+
+The positive coefficient for sleep suggests a linear relationship, consistent with patterns observed in the exploratory analysis.
+:::
+
+## Coefficient Plot
+
+```{r coef-plot, fig.height=4, fig.cap="Figure 7: MLR coefficient estimates with 95% confidence intervals"}
+tidy(mlr, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = case_when(
+      term == "TotalSleepTime"   ~ "Sleep (hrs)",
+      term == "cum_gpa"          ~ "Cumulative GPA",
+      term == "Zterm_units_ZofZ" ~ "Course Load (Z)",
+      TRUE ~ term),
+    significant = p.value < 0.05
+  ) %>%
+  ggplot(aes(estimate, fct_reorder(term, estimate), color = significant)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "#888888") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.2, linewidth = 0.8) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("FALSE" = "#AAAAAA", "TRUE" = "#C8102E"),
+                     labels = c("Not significant", "p < 0.05"), name = NULL) +
+  theme_minimal(base_size = 12) +
+  labs(title = "MLR Coefficient Plot (95% CI)",
+       subtitle = "Red = statistically significant at α = 0.05",
+       x = "Coefficient Estimate", y = NULL)
+```
+
+## Multicollinearity (VIF)
+
+```{r vif}
+vif(mlr) %>%
+  enframe(name = "Variable", value = "VIF") %>%
+  mutate(Concern = if_else(VIF > 5, "High", "OK")) %>%
+  kable(digits = 3, caption = "Table 5: Variance Inflation Factors")
+# All VIF < 2: no multicollinearity concern
+```
+
+## Diagnostic Plots
+
+```{r mlr-diagnostics, fig.height=6, fig.cap="Figure 8: Regression diagnostic plots (LINE assumption checks)"}
+diag_df <- data.frame(
+  fitted    = fitted(mlr),
+  residuals = residuals(mlr),
+  std_resid = rstandard(mlr),
+  leverage  = hatvalues(mlr)
+)
+
+p_rv <- ggplot(diag_df, aes(fitted, residuals)) +
+  geom_point(alpha = 0.4, color = "#2166AC") +
+  geom_hline(yintercept = 0, color = "#C8102E", linetype = "dashed") +
+  geom_smooth(se = FALSE, color = "#C8102E", linewidth = 0.8, method = "loess") +
+  theme_minimal(base_size = 11) +
+  labs(title = "Residuals vs Fitted", x = "Fitted Values", y = "Residuals")
+
+p_qq <- ggplot(diag_df, aes(sample = std_resid)) +
+  stat_qq(alpha = 0.5, color = "#2166AC") +
+  stat_qq_line(color = "#C8102E", linewidth = 0.9) +
+  theme_minimal(base_size = 11) +
+  labs(title = "Normal Q-Q Plot",
+       x = "Theoretical Quantiles", y = "Std. Residuals")
+
+p_sl <- ggplot(diag_df, aes(fitted, sqrt(abs(std_resid)))) +
+  geom_point(alpha = 0.4, color = "#2166AC") +
+  geom_smooth(se = FALSE, color = "#C8102E", linewidth = 0.8, method = "loess") +
+  theme_minimal(base_size = 11) +
+  labs(title = "Scale-Location", x = "Fitted Values", y = "√|Std. Residuals|")
+
+p_lv <- ggplot(diag_df, aes(leverage, std_resid)) +
+  geom_point(alpha = 0.4, color = "#2166AC") +
+  geom_hline(yintercept = c(-2, 2), linetype = "dashed", color = "#C8102E") +
+  theme_minimal(base_size = 11) +
+  labs(title = "Leverage vs Std. Residuals",
+       x = "Leverage", y = "Std. Residuals")
+
+(p_rv | p_qq) / (p_sl | p_lv)
+```
+
+::: fill-box
+**LINE Assumption Checks:**
+
+- **Linearity**: Residuals vs Fitted shows no strong pattern - assumption holds
+- **Independence**: Observations are independent students from different cohorts
+- **Normality**: Q-Q plot shows approximate normality with mild tail deviations
+- **Equal Variance**: Scale-Location plot is roughly flat - homoscedasticity satisfied
+- No extreme influential observations in the leverage plot
+:::
+
+::: result-box
+**Answer to RQ1:** Yes, sleep duration significantly affects term GPA (β = 0.10,
+p < 0.001) after controlling for cumulative GPA and course load. Each additional
+hour of sleep is associated with approximately a 0.10-point increase in GPA,
+holding other variables constant. However, cumulative GPA remains the dominant
+predictor (β = 0.67).
+:::
+
+---
+
+# One-Way ANOVA
+
+**Research Question:** Does mean GPA differ across study groups (universities)?
+
+**Hypothesis:** H₀: μ₁ = μ₂ = μ₃ = μ₄ vs Hₐ: Not all group means are equal
+
+## ANOVA F-Test & Effect Size
+
+```{r anova-model}
+anova_model <- aov(term_gpa ~ study, data = df_model)
+summary(anova_model)
+
+# Eta-squared effect size
+anova_tbl <- summary(anova_model)[[1]]
+eta_sq    <- anova_tbl["study", "Sum Sq"] / sum(anova_tbl[, "Sum Sq"])
+cat(sprintf("Eta-squared: %.4f (%.1f%% of variance explained by study group)\n",
+            eta_sq, 100 * eta_sq))
+```
+
+```{r anova-table}
+broom::tidy(anova_model) %>%
+  kable(digits = 4, caption = "Table 6: One-Way ANOVA Results")
+```
+
+## Assumption Checks
+
+```{r anova-assumptions}
+# Normality of residuals
+shapiro.test(residuals(anova_model))
+# Although residuals deviate from normality (p < 0.001), 
+# ANOVA is robust to such violations given the large sample size (n = 487)
+
+# Equality of variances
+leveneTest(term_gpa ~ study, data = df_model)
+# p > 0.05: equal variance assumption satisfied
+```
+
+## Post-Hoc: Tukey HSD
+
+```{r tukey-table}
+tukey_res <- TukeyHSD(anova_model)
+
+as.data.frame(tukey_res$study) %>%
+  rownames_to_column("Comparison") %>%
+  rename(Estimate = diff, Lower = lwr, Upper = upr, `p adj` = `p adj`) %>%
+  mutate(Significant = if_else(`p adj` < 0.05, "Yes", "No")) %>%
+  kable(digits = 4, caption = "Table 7: Tukey HSD Post-Hoc Comparisons")
+```
+
+```{r tukey-ci-plot, fig.height=5, fig.cap="Figure 9: Tukey HSD 95% confidence intervals for pairwise differences"}
+# Tukey HSD confidence interval plot (ggplot version - avoids base R 'main' bug)
+tukey_df <- as.data.frame(tukey_res$study) %>%
+  rownames_to_column("Comparison") %>%
+  rename(Estimate = diff, Lower = lwr, Upper = upr, p_adj = `p adj`) %>%
+  mutate(Significant = if_else(p_adj < 0.05, "Yes", "No"))
+
+ggplot(tukey_df, aes(x = Estimate, y = fct_reorder(Comparison, Estimate),
+                     color = Significant)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "#888888") +
+  geom_errorbarh(aes(xmin = Lower, xmax = Upper), height = 0.25,
+                 linewidth = 0.8) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("No" = "#AAAAAA", "Yes" = "#C8102E"),
+                     name = "p < 0.05") +
+  theme_minimal(base_size = 12) +
+  labs(title = "Tukey HSD 95% Family-Wise Confidence Intervals",
+       subtitle = "Intervals crossing zero = not significant",
+       x = "Difference in Mean GPA", y = NULL)
+```
+
+## ANOVA Visualization
+
+```{r anova-viz, fig.height=5, fig.cap="Figure 10: Mean term GPA by study group with 95% CI"}
+group_means <- df_model %>%
+  group_by(study) %>%
+  summarise(
+    mean_gpa = mean(term_gpa, na.rm = TRUE),
+    se       = sd(term_gpa, na.rm = TRUE) / sqrt(n()),
+    n        = n()
+  )
+
+ggplot(group_means, aes(fct_reorder(study, mean_gpa), mean_gpa, fill = study)) +
+  geom_col(width = 0.6, alpha = 0.85) +
+  geom_errorbar(aes(ymin = mean_gpa - 1.96 * se, ymax = mean_gpa + 1.96 * se),
+                width = 0.2, linewidth = 0.8) +
+  geom_text(aes(label = paste0(round(mean_gpa, 2), "\n(n=", n, ")")),
+            vjust = -0.6, size = 3.5) +
+  scale_fill_viridis_d(option = "D", begin = 0.2, end = 0.8) +
+  scale_y_continuous(limits = c(0, 4)) +
+  coord_flip() +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none") +
+  labs(title = "Mean Term GPA by Study Group",
+       subtitle = "Error bars = 95% CI",
+       x = NULL, y = "Mean Term GPA")
+```
+
+::: result-box
+**Answer to RQ2:** Yes, mean GPA differs significantly across study groups,
+F(3, 483) = 5.02, p = 0.002. Effect size η² ≈ 0.03 indicates study group
+explains approximately 3% of GPA variability - a small but statistically
+meaningful effect. Tukey HSD reveals three significant pairwise differences:
+Study 5 vs 1 (p = 0.041), Study 3 vs 2 (p = 0.048), and Study 5 vs 2
+(p = 0.006). Groups 1 and 2 tend to have higher mean GPA than groups 3 and 5.
+:::
+
+---
+
+# Logistic Regression
+
+**Research Question:** How do sleep duration, cumulative GPA, and course load
+predict whether a student achieves a high GPA (≥ 3.0)?
+
+**Model:** log(P(high_gpa=1) / (1 - P(high_gpa=1))) = β₀ + β₁(Sleep) + β₂(cum_gpa) + β₃(CourseLoad)
+
+## Model Fitting
+
+```{r logistic-model}
+logit <- glm(high_gpa ~ TotalSleepTime + cum_gpa + Zterm_units_ZofZ,
+             data = df_model, family = binomial)
+summary(logit)
+```
+
+## Odds Ratios with Confidence Intervals
+
+```{r odds-ratios}
+exp(cbind(OR = coef(logit), confint.default(logit))) %>%
+  as.data.frame() %>%
+  rownames_to_column("Term") %>%
+  filter(Term != "(Intercept)") %>%
+  rename(Lower_95 = `2.5 %`, Upper_95 = `97.5 %`) %>%
+  kable(digits = 4,
+        caption = "Table 8: Odds Ratios (exponentiated coefficients)")
+```
+
+::: result-box
+**Odds Ratio Interpretation (holding all else constant):**
+
+- **Sleep:** OR = 1.64 -  Each additional hour of sleep is associated with a 64% increase in the odds of achieving a high GPA, holding other variables constant.
+- **Cum GPA:** OR = 15.65 - Each 1-point increase in cumulative GPA multiplies the odds of achieving a high GPA by approximately 15.7.
+- **Course Load:** OR ≈ 0.97 - not significant (CI includes 1.0)
+:::
+
+## Predicted Probability vs Sleep
+
+```{r logistic-viz, fig.height=4.5, fig.cap="Figure 11: Predicted probability of high GPA vs sleep duration"}
+df_model_logit <- df_model %>%
+  mutate(pred_prob = predict(logit, type = "response"))
+
+ggplot(df_model_logit, aes(TotalSleepTime, pred_prob, color = high_gpa)) +
+  geom_point(alpha = 0.4, size = 1.5) +
+  geom_smooth(aes(group = 1), method = "loess", color = "#C8102E",
+              linewidth = 1, se = TRUE) +
+  scale_color_manual(values = c("0" = "#AAAAAA", "1" = "#2166AC"),
+                     labels = c("Low GPA", "High GPA"), name = "Actual") +
+  scale_y_continuous(labels = percent_format()) +
+  theme_minimal(base_size = 12) +
+  labs(title = "Predicted Probability of High GPA vs Sleep Duration",
+       x = "Total Sleep Time (hours)", y = "P(High GPA)")
+```
+
+## ROC Curve & AUC
+
+```{r roc-curve, fig.height=5, fig.cap="Figure 12: ROC curve for logistic regression model"}
+
+roc_obj <- roc(
+  response  = df_model_logit$high_gpa,
+  predictor = df_model_logit$pred_prob,
+  levels    = c("0", "1"),
+  quiet     = TRUE
+)
+
+auc_val <- round(as.numeric(auc(roc_obj)), 4)
+
+roc_df <- data.frame(
+  specificity = roc_obj$specificities,
+  sensitivity = roc_obj$sensitivities
+)
+
+ggplot(roc_df, aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(color = "#2166AC", linewidth = 1.2) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "#999999") +
+  
+  annotate("text",
+           x = 0.75, y = 0.15,
+           label = paste0("AUC = ", auc_val),
+           size = 4.5, color = "#C8102E") +
+  
+  coord_equal() +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "ROC Curve - Logistic Regression",
+    subtitle = "Predicting High GPA (≥ 3.0)",
+    x = "False Positive Rate",
+    y = "True Positive Rate"
+  )
+
+```
+
+## Confusion Matrix
+
+```{r confusion-matrix}
+pred_class <- factor(if_else(df_model_logit$pred_prob >= 0.5, "1", "0"),
+                     levels = levels(df_model_logit$high_gpa))
+cm <- confusionMatrix(pred_class, df_model_logit$high_gpa, positive = "1")
+cm
+```
+
+## Threshold Analysis
+
+```{r threshold-table}
+thresholds <- seq(0.3, 0.7, by = 0.05)
+
+threshold_tbl <- map_df(thresholds, function(th) {
+  pred <- factor(if_else(df_model_logit$pred_prob >= th, "1", "0"),
+                 levels = c("0", "1"))
+  cm_t <- confusionMatrix(pred, df_model_logit$high_gpa, positive = "1")
+  tibble(
+    Threshold   = th,
+    Accuracy    = cm_t$overall["Accuracy"],
+    Sensitivity = cm_t$byClass["Sensitivity"],
+    Specificity = cm_t$byClass["Specificity"],
+    Precision   = cm_t$byClass["Pos Pred Value"]
+  )
+})
+
+threshold_tbl %>%
+  kable(digits = 3, caption = "Table 9: Logistic Regression at Different Thresholds")
+```
+
+```{r threshold-tradeoff-plot, fig.height=4.5, fig.cap="Figure 13: Sensitivity/specificity/accuracy tradeoff across thresholds"}
+# NEW: Threshold tradeoff visualization
+threshold_tbl %>%
+  pivot_longer(cols = c(Accuracy, Sensitivity, Specificity, Precision),
+               names_to = "Metric", values_to = "Value") %>%
+  ggplot(aes(Threshold, Value, color = Metric)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "#888888") +
+  annotate("text", x = 0.52, y = 0.35, label = "Default (0.5)",
+           hjust = 0, size = 3, color = "#888888") +
+  scale_color_manual(values = c(
+    "Accuracy"    = "#2166AC",
+    "Sensitivity" = "#C8102E",
+    "Specificity" = "#22863a",
+    "Precision"   = "#6f42c1"
+  )) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  theme_minimal(base_size = 12) +
+  labs(title = "Classification Metrics Across Decision Thresholds",
+       subtitle = "Threshold of 0.5 provides reasonable sensitivity-specificity balance",
+       x = "Decision Threshold", y = "Metric Value")
+```
+
+::: result-box
+**Answer to RQ3:** Sleep duration positively influences the probability of
+achieving a high GPA (OR = 1.64, p < 0.05), but cumulative GPA remains the
+dominant predictor (OR = 15.65). The model achieves AUC = `r auc_val`,
+indicating good discrimination. At threshold = 0.5: accuracy ≈ 84%, sensitivity
+≈ 96%, specificity ≈ 31%. The low specificity reflects class imbalance (~82%
+of students have high GPA). Threshold 0.5 is retained as a reasonable
+compromise. The ROC curve demonstrates strong discrimination between high and low GPA students despite class imbalance in the dataset.
+:::
+
+---
+
+# Machine Learning Pipeline (caret)
+
+Following the industry-standard caret framework: **split → preprocess →
+cross-validate → compare → evaluate**.
+
+## Train/Test Split
+
+```{r ml-split, fig.height=3.5}
+set.seed(6105)
+
+df_ml <- df_model %>%
+  select(term_gpa, TotalSleepTime, cum_gpa, Zterm_units_ZofZ) %>%
+  drop_na()
+
+train_idx  <- createDataPartition(df_ml$term_gpa, p = 0.80, list = FALSE)
+train_data <- df_ml[ train_idx, ]
+test_data  <- df_ml[-train_idx, ]
+
+cat(sprintf("Training observations: %d | Test observations: %d\n",
+            nrow(train_data), nrow(test_data)))
+
+bind_rows(
+  train_data %>% mutate(split = "Train"),
+  test_data  %>% mutate(split = "Test")
+) %>%
+  ggplot(aes(term_gpa, fill = split)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("Train" = "#2166AC", "Test" = "#C8102E")) +
+  theme_minimal(base_size = 12) +
+  labs(title = "GPA Distribution: Train vs Test Split",
+       x = "Term GPA", y = "Density", fill = "Split")
+```
+
+## Cross-Validation & Model Zoo
+
+```{r cv-control}
+ctrl <- trainControl(
+  method          = "cv",
+  number          = 10,
+  savePredictions = "final",
+  verboseIter     = FALSE
+)
+```
+
+```{r model-zoo, cache=TRUE}
+set.seed(6105)
+
+# Linear Regression
+m_lm <- train(term_gpa ~ ., data = train_data, method = "lm",
+              preProcess = c("center", "scale"), trControl = ctrl)
+
+# K-Nearest Neighbours
+m_knn <- train(term_gpa ~ ., data = train_data, method = "knn",
+               preProcess = c("center", "scale"), trControl = ctrl,
+               tuneGrid = data.frame(k = c(5, 7, 9, 11, 15, 21)))
+
+# Decision Tree
+m_tree <- train(term_gpa ~ ., data = train_data, method = "rpart",
+                preProcess = c("center", "scale"), trControl = ctrl,
+                tuneLength = 10)
+
+# Random Forest
+m_rf <- train(term_gpa ~ ., data = train_data, method = "rf",
+              preProcess = c("center", "scale"), trControl = ctrl,
+              tuneGrid = data.frame(mtry = c(1, 2, 3)),
+              ntree = 200)
+
+# Ridge Regression
+m_ridge <- train(term_gpa ~ ., data = train_data, method = "glmnet",
+                 preProcess = c("center", "scale"), trControl = ctrl,
+                 tuneGrid = expand.grid(alpha = 0,
+                                        lambda = 10^seq(-3, 1, length = 30)))
+
+# Lasso Regression
+m_lasso <- train(term_gpa ~ ., data = train_data, method = "glmnet",
+                 preProcess = c("center", "scale"), trControl = ctrl,
+                 tuneGrid = expand.grid(alpha = 1,
+                                        lambda = 10^seq(-3, 1, length = 30)))
+```
+
+## Cross-Validation Comparison
+
+```{r model-comparison}
+resamps <- resamples(list(
+  `Linear`        = m_lm,
+  `KNN`           = m_knn,
+  `Decision Tree` = m_tree,
+  `Random Forest` = m_rf,
+  `Ridge`         = m_ridge,
+  `Lasso`         = m_lasso
+))
+
+summary(resamps)$statistics$RMSE %>%
+  as.data.frame() %>%
+  rownames_to_column("Model") %>%
+  arrange(Mean) %>%
+  kable(digits = 4, caption = "Table 10: 10-Fold CV RMSE Across Models")
+```
+
+```{r dotplot-cv, fig.height=5, fig.cap="Figure 14: 10-fold CV RMSE comparison across models"}
+dotplot(resamps, metric = "RMSE",
+        main = "10-Fold CV RMSE - Model Comparison")
+```
+
+```{r bwplot-cv, fig.height=5, fig.cap="Figure 15: 10-fold CV R-squared comparison across models"}
+bwplot(resamps, metric = "Rsquared",
+       main = "10-Fold CV R² - Model Comparison")
+```
+
+## Test Set Evaluation
+
+```{r test-evaluation}
+eval_model <- function(model, name) {
+  preds <- predict(model, newdata = test_data)
+  pr    <- postResample(pred = preds, obs = test_data$term_gpa)
+  tibble(Model = name, RMSE = pr["RMSE"], MAE = pr["MAE"],
+         Rsquared = pr["Rsquared"])
+}
+
+test_results <- bind_rows(
+  eval_model(m_lm,    "Linear Regression"),
+  eval_model(m_knn,   "KNN"),
+  eval_model(m_tree,  "Decision Tree"),
+  eval_model(m_rf,    "Random Forest"),
+  eval_model(m_ridge, "Ridge Regression"),
+  eval_model(m_lasso, "Lasso Regression")
+) %>%
+  arrange(RMSE)
+
+test_results %>%
+  kable(digits = 4, caption = "Table 11: Test Set Performance")
+```
+
+## Actual vs Predicted (Best Model)
+
+```{r actual-vs-predicted, fig.height=5, fig.cap="Figure 16: Actual vs predicted GPA for best model"}
+best_model_name <- test_results$Model[1]
+best_model_obj  <- list(
+  "Linear Regression" = m_lm,
+  "KNN"               = m_knn,
+  "Decision Tree"     = m_tree,
+  "Random Forest"     = m_rf,
+  "Ridge Regression"  = m_ridge,
+  "Lasso Regression"  = m_lasso
+)[[best_model_name]]
+
+pred_all <- tibble(
+  Actual    = test_data$term_gpa,
+  Predicted = predict(best_model_obj, newdata = test_data),
+  Residual  = Actual - Predicted
+)
+
+p_avp <- ggplot(pred_all, aes(Actual, Predicted)) +
+  geom_point(aes(color = abs(Residual)), alpha = 0.65, size = 2) +
+  geom_abline(linetype = "dashed", color = "#C8102E", linewidth = 1) +
+  scale_color_viridis_c(option = "C", name = "|Residual|") +
+  theme_minimal(base_size = 12) +
+  labs(title = paste("Actual vs Predicted -", best_model_name),
+       subtitle = "Dashed line = perfect prediction",
+       x = "Actual Term GPA", y = "Predicted Term GPA")
+
+p_res <- ggplot(pred_all, aes(Predicted, Residual)) +
+  geom_point(aes(color = abs(Residual)), alpha = 0.65, size = 2) +
+  geom_hline(yintercept = 0, color = "#C8102E", linetype = "dashed") +
+  scale_color_viridis_c(option = "C", name = "|Residual|") +
+  theme_minimal(base_size = 12) +
+  labs(title = "Residuals vs Predicted",
+       x = "Predicted Term GPA", y = "Residual")
+
+p_avp | p_res
+```
+
+## Variable Importance
+
+```{r variable-importance, fig.height=4, fig.cap="Figure 17: Variable importance from Random Forest model"}
+vi_rf <- varImp(m_rf)$importance %>%
+  rownames_to_column("Variable") %>%
+  arrange(desc(Overall)) %>%
+  mutate(Variable = case_when(
+    Variable == "cum_gpa"          ~ "Cumulative GPA",
+    Variable == "TotalSleepTime"   ~ "Sleep Duration (hrs)",
+    Variable == "Zterm_units_ZofZ" ~ "Course Load (Z)",
+    TRUE ~ Variable
+  ))
+
+ggplot(vi_rf, aes(Overall, fct_reorder(Variable, Overall),
+                  fill = Variable == "Sleep Duration (hrs)")) +
+  geom_col(width = 0.55) +
+  scale_fill_manual(values = c("FALSE" = "#AAAAAA", "TRUE" = "#C8102E"),
+                    guide = "none") +
+  theme_minimal(base_size = 12) +
+  labs(title = "Variable Importance - Random Forest",
+       subtitle = "Sleep highlighted in red",
+       x = "Importance Score", y = NULL)
+```
+
+::: result-box
+**ML Pipeline Findings:**
+
+- Cumulative GPA dominates as the most important predictor across all models
+- Linear and regularized models perform competitively; complex models (KNN,
+  Decision Tree) do not provide major gains
+- This confirms that the sleep-GPA relationship is largely linear
+- Best model: `r best_model_name` (Test RMSE = `r round(test_results$RMSE[1], 4)`)
+:::
+
+---
+
+# Nonparametric Validation
+
+**Research Question:** Are the GPA group differences and sleep-GPA association
+robust when distributional assumptions are relaxed?
+
+**Justification:** The Shapiro-Wilk test (p < 0.001) indicated non-normality of
+ANOVA residuals. Nonparametric methods do not assume normal distributions,
+providing a robustness check.
+
+```{r nonparametric}
+# Kruskal-Wallis: nonparametric alternative to ANOVA
+kw <- kruskal.test(term_gpa ~ study, data = df_model)
+
+# Spearman correlation: nonparametric alternative to Pearson
+sp <- cor.test(df_model$TotalSleepTime, df_model$term_gpa,
+               method = "spearman", use = "complete.obs")
+
+# Comparison table
+tibble(
+  Test = c("Kruskal-Wallis (study → GPA)", "Spearman (sleep ~ GPA)"),
+  Statistic = c(round(kw$statistic, 3), round(sp$estimate, 4)),
+  `p-value`  = c(format.pval(kw$p.value, digits = 3),
+                 format.pval(sp$p.value, digits = 3)),
+  `Parametric Equivalent` = c(
+    paste0("ANOVA: F = 5.02, p = 0.002"),
+    paste0("Pearson: r = ", round(cor(df_model$TotalSleepTime,
+           df_model$term_gpa), 4))
+  ),
+  Conclusion = c(
+    if_else(kw$p.value < 0.05,
+            "Confirms ANOVA: groups differ",
+            "Contradicts ANOVA"),
+    if_else(sp$p.value < 0.05,
+            "Confirms positive sleep-GPA association",
+            "No significant association")
+  )
+) %>%
+  kable(caption = "Table 12: Nonparametric Validation - Comparison with Parametric Results")
+```
+
+::: result-box
+**Answer to RQ4:** Yes. Kruskal-Wallis (χ² = `r round(kw$statistic, 2)`,
+p = `r format.pval(kw$p.value, digits = 3)`) confirms that GPA differs
+significantly across study groups, consistent with the parametric ANOVA.
+Spearman correlation (ρ = `r round(sp$estimate, 3)`,
+p = `r format.pval(sp$p.value, digits = 3)`) confirms a significant positive
+monotonic association between sleep and GPA. Both nonparametric results validate
+the parametric findings, demonstrating that conclusions are robust to
+distributional assumptions.
+:::
+
+---
+
+# Summary of Findings
+
+```{r findings-table, echo=FALSE}
+tibble(
+  Method = c("Multiple Linear Regression", "One-Way ANOVA",
+             "Logistic Regression", "ML Pipeline (caret)",
+             "Nonparametric Tests"),
+  `Key Finding` = c(
+    paste0("R² = ", round(glance(mlr)$r.squared, 3),
+           "; cum_gpa strongest (β=0.67); sleep significant (β=0.10, p<0.001)"),
+    paste0("F(3,483) = 5.02, p = 0.002; η² = ", round(eta_sq, 3),
+           "; 3 significant pairwise differences"),
+    paste0("AUC = ", auc_val,
+           "; each hour of sleep → 64% higher odds of high GPA"),
+    paste0("Best: ", best_model_name, " (RMSE = ",
+           round(test_results$RMSE[1], 4),
+           "); linear models outperform complex models"),
+    paste0("Kruskal-Wallis p = ", format.pval(kw$p.value, digits = 3),
+           "; Spearman ρ = ", round(sp$estimate, 3), " - confirms all findings")
+  )
+) %>%
+  kable(caption = "Table 13: Summary of Statistical Findings Across All Methods")
+```
+
+---
+
+# Conclusion
+
+- **Cumulative GPA** is by far the strongest predictor of term GPA across every
+  method tested (β = 0.67, OR = 15.65, highest variable importance)
+- **Sleep duration** shows a consistent, positive, and statistically significant
+  but modest association with academic performance (β = 0.10, OR = 1.64,
+  Spearman ρ > 0)
+- Students sleeping **more than 8 hours** have the highest proportion of high
+  GPAs, while those sleeping **less than 6 hours** have the lowest
+- **GPA varies significantly by study group** (p = 0.002, η² = 0.03),
+  suggesting institutional or cohort-level factors play a role
+- **All five analytical approaches converge** on the same general conclusion,
+  strengthening confidence in these findings
+- Simpler linear models match or outperform complex ML models, confirming
+  that the underlying relationships are primarily linear
+- This suggests that the relationship between predictors and GPA is predominantly linear, with limited benefit from nonlinear modeling approaches
+- These results are consistent across parametric, nonparametric, and machine learning approaches, strengthening the robustness of the findings
+
+::: concept-box
+**Practical Implication:** Encouraging adequate sleep (≥ 7 hours) may
+contribute to better academic outcomes, but prior academic performance is the
+strongest single driver. Sleep improvement should be considered one component
+of a broader academic support strategy, rather than a standalone intervention.
+:::
+
+---
+
+# Limitations
+
+Several limitations should be considered when interpreting these findings:
+
+- **Observational design:** The data are observational, so the analyses
+  identify associations rather than causal effects. Although sleep duration
+  is positively related to GPA, these results do not prove that increasing
+  sleep will directly improve academic performance.
+
+- **Measurement error:** Sleep was measured using wearable Fitbit devices,
+  which may introduce error through imperfect accuracy, missed wear time,
+  or incomplete nightly capture. Such error could attenuate the estimated
+  sleep–GPA relationship.
+
+- **Missing data:** The course load variable (Zterm_units_ZofZ) has ~23.2%
+  missing values. Complete-case analysis reduces the sample from 634 to 487
+  and may introduce bias if missingness is not random.
+
+- **Limited generalizability:** The dataset includes only first-year students
+  from three U.S. universities. Findings may not generalize to upper-year
+  students, other institutions, or non-U.S. populations.
+
+- **Unmeasured confounders:** Important factors such as stress, motivation,
+  study habits, mental health, and social support are not captured in the
+  dataset. These omitted variables may partly explain both sleep patterns
+  and academic performance, potentially confounding the observed
+  association.
+
+---
+
+# References
+
+1. CMU S&DS Data Repository - Nightly Sleep Time and GPA in First-Year Students
+   (2023 dataset, publicly available).
+   https://cmustatistics.github.io/data-repository/
+
+2. Creswell, J. D., et al. (2023). Nightly sleep duration predicts grade point
+   average in the first year of college. *Proceedings of the National Academy
+   of Sciences*.
+
+3. Kuhn, M. (2008). Building predictive models in R using the caret package.
+   *Journal of Statistical Software*.
+
+4. Robin, X., et al. (2011). pROC: An open-source package for R and S+ to
+   analyze and compare ROC curves. *BMC Bioinformatics*.
+
+5. Fox, J., & Weisberg, S. (2019). *An R Companion to Applied Regression*.
+   Sage Publications.
+
+6. Wickham, H., et al. (2019). Welcome to the tidyverse. *Journal of Open
+   Source Software*.
+
+---
+
+```{r session-info, echo=FALSE}
+sessionInfo()
+```
